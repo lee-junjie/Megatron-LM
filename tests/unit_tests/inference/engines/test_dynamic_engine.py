@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import asyncio
 import random
 import types
 from dataclasses import dataclass
@@ -11,13 +12,14 @@ from tqdm import tqdm
 
 from megatron.core import parallel_state
 from megatron.core.inference.contexts.dynamic_context import (
+    ActiveRequestCountOverflowError,
     ChunkOverflowError,
     DynamicInferenceContext,
     RequestOverflowError,
     TokenOverflowError,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
-from megatron.core.inference.inference_request import Status
+from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -61,7 +63,7 @@ class Request:
 
 
 @dataclass
-class TestConfig:
+class DynamicEngineTestConfig:
     """Test configuration args."""
 
     set_rounder(4)
@@ -79,6 +81,7 @@ class TestConfig:
     tensor_model_parallel_size: int = 1
 
     use_fixed_output_lengths: bool = False
+    num_cuda_graphs: int = None
 
     def __post_init__(self):
 
@@ -97,10 +100,10 @@ class TestConfig:
 
 
 @dataclass
-class TestEnv:
+class DynamicEngineTestEnv:
     """Test environment, including requests and engine."""
 
-    config: TestConfig
+    config: DynamicEngineTestConfig
     sampling_params: SamplingParams
     requests: List[Request]
     engine: DynamicInferenceEngine
@@ -136,7 +139,10 @@ class TestDynamicInferenceEngine:
 
     @classmethod
     def _build_inference_context(
-        cls, test_config: TestConfig, transformer_config: TransformerConfig, requests: List[Request]
+        cls,
+        test_config: DynamicEngineTestConfig,
+        transformer_config: TransformerConfig,
+        requests: List[Request],
     ):
         """The inference context manages the KV cache and other inference state."""
 
@@ -151,6 +157,7 @@ class TestDynamicInferenceEngine:
             kv_channels=transformer_config.kv_channels,
             num_attention_heads=transformer_config.num_query_groups,
             max_sequence_length=max_sequence_length,
+            num_cuda_graphs=test_config.num_cuda_graphs,
             buffer_size_gb=test_config.context_buffer_size_gb,
             buffer_guaranteed_fraction=test_config.context_buffer_guaranteed_fraction,
             chunk_size_tokens=test_config.context_chunk_size_tokens,
@@ -177,7 +184,12 @@ class TestDynamicInferenceEngine:
         # Random state.
         random.seed(random_seed)
         torch.manual_seed(random_seed)
-        model_parallel_cuda_manual_seed(random_seed)
+        model_parallel_cuda_manual_seed(
+            seed=random_seed,
+            inference_rng_tracker=True,
+            use_cudagraphable_rng=False,
+            force_reset_rng=True,
+        )
 
         # Transformer config.
         transformer_config = TransformerConfig(
@@ -186,6 +198,8 @@ class TestDynamicInferenceEngine:
             hidden_size=32,
             num_attention_heads=4,
             use_cpu_initialization=True,
+            enable_cuda_graph=test_config.num_cuda_graphs is not None,
+            inference_rng_tracker=True,
             tensor_model_parallel_size=test_config.tensor_model_parallel_size,
         )
 
@@ -253,7 +267,7 @@ class TestDynamicInferenceEngine:
         )
 
         # Test env.
-        env = TestEnv(
+        env = DynamicEngineTestEnv(
             config=test_config, sampling_params=sampling_params, requests=requests, engine=engine
         )
 
@@ -269,7 +283,9 @@ class TestDynamicInferenceEngine:
     def _run_step(cls, env):
         set_rounder(4)
         # Step inference engine (i.e., generate one token per request).
-        finished_requests, step_time = env.engine.step(env.sampling_params, verbose=False)
+        active_requests, finished_requests, step_time = env.engine.step(
+            env.sampling_params, verbose=False
+        )
 
         # Nothing done?
         if len(finished_requests) == 0:
@@ -285,7 +301,7 @@ class TestDynamicInferenceEngine:
     def _run_test(cls, **test_config_kwargs):
 
         # Test environment.
-        test_config = TestConfig(**test_config_kwargs)
+        test_config = DynamicEngineTestConfig(**test_config_kwargs)
         env = cls._build_test_env(test_config)
 
         # Add requests to engine.
@@ -388,7 +404,7 @@ class TestDynamicInferenceEngine:
     )
     def test_token_overflow(self) -> None:
         """Test token overflow."""
-        test_config = TestConfig(context_max_tokens_override=8)
+        test_config = DynamicEngineTestConfig(context_max_tokens_override=8)
         env = self._build_test_env(test_config)
         env.engine.add_request(0, env.requests[0].prompt, env.requests[0].num_tokens_to_generate)
         assert list(env.engine.waiting_request_ids) == [0]
@@ -398,11 +414,11 @@ class TestDynamicInferenceEngine:
     )
     def test_chunk_overflow(self) -> None:
         """Test token overflow."""
-        env = self._build_test_env(TestConfig())
+        env = self._build_test_env(DynamicEngineTestConfig())
         context = env.engine.context
         chunk_size_bytes = context.chunk_size_bytes
         buffer_size_gb = (chunk_size_bytes + 1) / 1024**3
-        test_config = TestConfig(context_buffer_size_gb=buffer_size_gb)
+        test_config = DynamicEngineTestConfig(context_buffer_size_gb=buffer_size_gb)
         env = self._build_test_env(test_config)
         env.engine.add_request(0, env.requests[0].prompt, env.requests[0].num_tokens_to_generate)
         assert list(env.engine.waiting_request_ids) == [0]
@@ -421,13 +437,101 @@ class TestDynamicInferenceEngine:
         """Test generating a fixed number of output tokens."""
         self._run_test(use_fixed_output_lengths=True)
 
+    def test_cuda_graph_request_counts(self) -> None:
+        """Test initialization of `cuda_graph_request_counts` in dynamic context."""
+
+        # Test num_cuda_graphs.
+        for num_cuda_graphs, expected_cuda_graph_request_counts in [
+            (0, [64]),
+            (1, [64]),
+            (2, [64, 32]),
+            (4, [64, 48, 32, 16]),
+            (8, [64, 56, 48, 40, 32, 24, 16, 8]),
+            (16, [64, 56, 48, 40, 32, 24, 16, 8]),
+            (64, [64, 56, 48, 40, 32, 24, 16, 8]),
+            (1024, [64, 56, 48, 40, 32, 24, 16, 8]),
+        ]:
+            env = self._build_test_env(
+                DynamicEngineTestConfig(num_requests=64, num_cuda_graphs=num_cuda_graphs)
+            )
+            actual_cuda_graph_request_counts = env.engine.context.cuda_graph_request_counts
+            assert (
+                actual_cuda_graph_request_counts == expected_cuda_graph_request_counts
+            ), "num_cuda_graphs %d ... cuda_graph_request_counts: expected %s, found %s." % (
+                num_cuda_graphs,
+                expected_cuda_graph_request_counts,
+                actual_cuda_graph_request_counts,
+            )
+
+    def test_cuda_graph_warmup(self) -> None:
+        """Test initialization during cuda graph warmup."""
+
+        # Initialize context.
+        env = self._build_test_env(DynamicEngineTestConfig(num_requests=32, num_cuda_graphs=8))
+
+        context = env.engine.context
+        assert context.is_decode_only()
+        assert context.cuda_graph_request_counts == [
+            32,
+            24,
+            16,
+            8,
+        ], "cuda_graph_request_counts: %s." % str(context.cuda_graph_request_counts)
+
+        # Iterate request counts.
+        for num_warmup_requests, expected_cuda_graph_request_count in [
+            (1, 8),
+            (2, 8),
+            (4, 8),
+            (8, 8),
+            (10, 16),
+            (12, 16),
+            (16, 16),
+            (20, 24),
+            (24, 24),
+            (28, 32),
+            (32, 32),
+        ]:
+
+            # Initialize attention state.
+            context.initialize_attention_state(num_warmup_requests=num_warmup_requests)
+
+            # Validate request & token counts.
+            assert (
+                expected_cuda_graph_request_count
+                == context.padded_active_request_count
+                == context.padded_active_token_count
+            ), (
+                "failed ... num_warmup_requests (%d) ... expected_cuda_graph_request_count (%d) == context.padded_active_request_count (%d) == context.padded_active_token_count (%d)"
+                % (
+                    num_warmup_requests,
+                    expected_cuda_graph_request_count,
+                    context.padded_active_request_count,
+                    context.padded_active_token_count,
+                )
+            )
+
+            # Validate input/position dimensions.
+            input_ids, pos_ids = context.current_input_and_position_ids()
+            assert input_ids.shape[1] == pos_ids.shape[1] == expected_cuda_graph_request_count
+
+        # Test active request count overflow.
+        for num_warmup_requests in (64, 128, 1024):
+            try:
+                context.initialize_attention_state(num_warmup_requests=num_warmup_requests)
+            except ActiveRequestCountOverflowError as e:
+                continue
+            raise Exception("`ActiveRequestCountOverflowError should have been raised.")
+
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     def test_generate_function(self) -> None:
         """Test the generate function that processes multiple prompts at once."""
         # Set up test environment
-        test_config = TestConfig(num_requests=4, max_prompt_length=8, max_output_length=4)
+        test_config = DynamicEngineTestConfig(
+            num_requests=4, max_prompt_length=8, max_output_length=4
+        )
         env = self._build_test_env(test_config)
 
         # Create string prompts (just mock strings, since the test environment mocks the tokenizer)
@@ -454,3 +558,48 @@ class TestDynamicInferenceEngine:
             # Verify each request has generated tokens
             assert len(request.generated_tokens) > 0, f"Request {i} should have generated tokens"
             assert request.status == Status.COMPLETED, f"Request {i} should be completed"
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    async def test_run_engine(self):
+        """
+        Test asynchronously adding and waiting for requests while the engine is
+        running continuously.
+        """
+        # Test environment.
+        test_config = DynamicEngineTestConfig(use_fixed_output_lengths=True)
+        env = self._build_test_env(test_config)
+
+        engine_task = asyncio.create_task(
+            env.engine.run_engine(sampling_params=env.sampling_params, verbose=False)
+        )
+
+        request_completion_futures: Dict[int, asyncio.Future[DynamicInferenceRequest]] = {}
+
+        # Add requests to engine.
+        for request_id in tqdm(range(len(env.requests)), "add requests"):
+
+            # Add request.
+            num_tokens_to_generate = env.requests[request_id].num_tokens_to_generate
+            request_completion_futures[request_id] = env.engine.add_request(
+                request_id,
+                env.requests[request_id].prompt,
+                num_tokens_to_generate=num_tokens_to_generate,
+            )
+            env.requests[request_id].state = "pending"
+
+        # Wait for all requests to complete.
+        await asyncio.gather(*request_completion_futures.values())
+
+        # Verify that all request outputs were set.
+        for request_id, fut in request_completion_futures.items():
+            num_tokens_to_generate = env.requests[request_id].num_tokens_to_generate
+            result = fut.result()
+            assert result.generated_length == num_tokens_to_generate, (
+                f"Request {request_id} expected to generate {num_tokens_to_generate} "
+                f"tokens but generated {result.generated_length}"
+            )
+
+        engine_task.cancel()

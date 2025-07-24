@@ -12,9 +12,10 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.custom_fsdp.fully_sharded_data_parallel import (
     FullyShardedDataParallel,
 )
+from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-from megatron.core.process_groups_config import GradCommProcessGroups
+from megatron.core.process_groups_config import GradCommProcessGroups, ModelCommProcessGroups
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -81,7 +82,18 @@ class TestFullyShardedDataParallel:
     @pytest.mark.parametrize("dp_size", [2, 8])  # Test with 2 or 8 GPUs
     def test_fsdp_with_process_groups(self, dp_size):
         """Test that FSDP works correctly with different process group configurations."""
-        from torch.distributed.device_mesh import init_device_mesh
+        # Initialize torch.distributed if not already initialized
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend='nccl')
+
+        # Create HyperCommGrid with dp dimension
+        grid = HyperCommGrid([dp_size], ["dp"])
+
+        # Create process groups config with ONLY dp group
+        grad_comm_pgs = GradCommProcessGroups()
+        model_comm_pgs = ModelCommProcessGroups()
+
+        grad_comm_pgs.dp = grid.create_pg("dp")
 
         # Skip test if we don't have enough GPUs
         world_size = torch.distributed.get_world_size()
@@ -118,14 +130,6 @@ class TestFullyShardedDataParallel:
             module=model1,
             fsdp_unit_modules=[torch.nn.Linear],
         )
-
-        # Create a 1D mesh with dimension [dp_size]
-        device_mesh = init_device_mesh("cuda", (dp_size,), mesh_dim_names=("dp",))
-        grad_comm_pgs = GradCommProcessGroups()
-
-        # Get dp process group from device mesh
-        dp_group = device_mesh.get_group(mesh_dim="dp")
-        grad_comm_pgs.dp = dp_group
 
         # Wrap second model with explicit process groups
         fsdp_model2 = FullyShardedDataParallel(
@@ -213,10 +217,6 @@ class TestFullyShardedDataParallel:
             # test branch.
             delattr(torch.nn.parameter.Parameter, "main_grad")
 
-    @pytest.mark.skipif(
-        version.parse(torch.__version__) < version.parse('2.3.0'),
-        reason="nccl_ub requires a recent version of APEX",
-    )
     # Testing fsdp_double_buffer with and without nccl_ub
     @pytest.mark.parametrize(
         ("dp_size", "nccl_ub", "fsdp_double_buffer"), [(8, False, True), (8, True, True)]
@@ -227,6 +227,23 @@ class TestFullyShardedDataParallel:
         Baseline fsdp: nccl_ub=False, fsdp_double_buffer=False
         Target fsdp: nccl_ub=[True, False], fsdp_double_buffer=[True, False]
         """
+
+        # Skip nccl_ub=True cases if PyTorch version is less than 2.7.0
+        if nccl_ub and version.parse(torch.__version__) < version.parse('2.7.0'):
+            pytest.skip("nccl_ub requires PyTorch 2.7.0 or later")
+
+        # Initialize torch.distributed if not already initialized
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend='nccl')
+
+        # Create HyperCommGrid with dp dimension
+        grid = HyperCommGrid([dp_size], ["dp"])
+
+        # Create process groups config with ONLY dp group
+        grad_comm_pgs = GradCommProcessGroups()
+        model_comm_pgs = ModelCommProcessGroups()
+
+        grad_comm_pgs.dp = grid.create_pg("dp")
 
         # Skip test if we don't have enough GPUs
         world_size = torch.distributed.get_world_size()

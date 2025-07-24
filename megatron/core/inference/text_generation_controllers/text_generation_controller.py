@@ -24,18 +24,21 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.utils import get_attention_mask
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.utils import get_model_config
 
 try:
+    import transformer_engine as te  # pylint: disable=unused-import
 
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
 
     HAVE_TE = True
 
 except ImportError:
-
     HAVE_TE = False
+    Fp8Padding = None
+    Fp8Unpadding = None
 
 
 class TextGenerationController:
@@ -196,8 +199,8 @@ class TextGenerationController:
                 and indices as the top k elements. None if sampling params top_n_logprobs is 0.
         """
 
-        if kwargs.get('common_inference_params'):
-            sampling_params = kwargs['common_inference_params']
+        if kwargs.get("common_inference_params"):
+            sampling_params = kwargs["common_inference_params"]
 
         top_p = sampling_params.top_p
         top_k = sampling_params.top_k
@@ -205,13 +208,13 @@ class TextGenerationController:
 
         assert isinstance(top_p, float)
         assert isinstance(top_k, int)
-        assert not (top_k > 0 and top_p > 0.0), 'Cannot have top-p and top-k both greater than zero'
-        assert top_p <= 1.0, 'top-p should be in (0,1]'
+        assert not (top_k > 0 and top_p > 0.0), "Cannot have top-p and top-k both greater than zero"
+        assert top_p <= 1.0, "top-p should be in (0,1]"
 
         def modify_logits_for_top_k_filtering(logits, top_k):
             """Set the logits for none top-k values to -inf."""
             filter_ = logits < torch.topk(logits, top_k)[0][..., -1, None]
-            logits.masked_fill_(filter_, float('-Inf'))
+            logits.masked_fill_(filter_, float("-Inf"))
 
         def modify_logits_for_top_p_filtering(logits, top_p):
             """Set the logits for none top-p values to -inf."""
@@ -231,7 +234,7 @@ class TextGenerationController:
 
             # Fill in the filtered part
             filter_ = filter_.scatter(1, sorted_indices, filter_)
-            logits.masked_fill_(filter_, float('-Inf'))
+            logits.masked_fill_(filter_, float("-Inf"))
 
         if sampling_params.top_n_logprobs > 0:
             # NOTE : This thing can also be clubbed with where we compute log probs
@@ -288,9 +291,9 @@ class TextGenerationController:
             if temperature != 1.0:
                 last_token_logits.div_(temperature)
             if top_k > 1:
-                assert top_k <= last_token_logits.size(1), 'top-k is larger than logit size.'
+                assert top_k <= last_token_logits.size(1), "top-k is larger than logit size."
                 if vocab_size:
-                    assert top_k < vocab_size, 'top-k is larger than vocab size.'
+                    assert top_k < vocab_size, "top-k is larger than vocab size."
                 modify_logits_for_top_k_filtering(last_token_logits, top_k)
 
             elif top_p > 0.0:
@@ -314,6 +317,7 @@ class TextGenerationController:
         current_context_end_position: int,
         is_generation_done_tensor: torch.Tensor,
         generated_sequence_lengths: torch.Tensor,
+        termination_id: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Checks which prompts have reached an end condition
 
@@ -339,10 +343,12 @@ class TextGenerationController:
             Tuple[torch.Tensor, torch.Tensor]: Returns the boolean
                 is_generation_done_tensor and the generated_sequence_lengths after updating it
         """
+        if termination_id is None:
+            termination_id = self.tokenizer.eod
         latest_samples = updated_prompts_tokens[:, current_context_end_position]
         # Make sure we are checking eod criterion only for prompts that have started generating
         # (i.e) We only look at the generated tokenns and not the input tokens.
-        reached_eod = (latest_samples == self.tokenizer.eod) & generation_started
+        reached_eod = (latest_samples == termination_id) & generation_started
         is_generation_done_tensor = is_generation_done_tensor | reached_eod
         # We increment generated sequence lengths when that prompt has not hit the
         # EOD and generation has started
@@ -355,7 +361,7 @@ class TextGenerationController:
         batch_prompt_tokens_list: List[List[int]],
         padded_batch_size: int,
         padded_sequence_length: int,
-        fp8_padding: Optional[Fp8Padding] = None,
+        fp8_padding: Optional["Fp8Padding"] = None,
     ) -> torch.Tensor:
         """Method to pad input prompts
 
@@ -395,7 +401,7 @@ class TextGenerationController:
         self,
         padded_batch_prompt_tokens: torch.Tensor,
         original_batch_size: int,
-        fp8_unpadding: Optional[Fp8Unpadding] = None,
+        fp8_unpadding: Optional["Fp8Unpadding"] = None,
     ):
         """Truncates the given input tensor back to the original prompt size before padding.
 
@@ -426,6 +432,11 @@ class TextGenerationController:
 
         context = self.inference_wrapped_model.inference_context
 
+        if sampling_params.return_log_probs:
+            assert (
+                context.materialize_only_last_token_logits is False
+            ), "Materialize only last token logits must be false for returning log probs"
+
         # No tokens?
         if context.active_token_count == 0:
             return None
@@ -434,8 +445,7 @@ class TextGenerationController:
         context.initialize_attention_state()
 
         # Get flat tokens, position ids.
-        input_ids = context.current_input_ids()
-        position_ids = context.current_position_ids()
+        input_ids, position_ids = context.current_input_and_position_ids()
 
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
@@ -475,7 +485,13 @@ class TextGenerationController:
                 pp_group=self.pp_group,
             )
 
-        last_token_logits = logits.squeeze(0)
+        # Last token logits.
+        if context.materialize_only_last_token_logits:
+            # When materialize_only_last_token_logits is true, last_token_logits is
+            # already called in the forward pass of GPT.
+            last_token_logits = logits.squeeze(0)
+        else:
+            last_token_logits = context.last_token_logits(logits)
 
         # Sample.
         # Use padded vocab size because tokenizer vocab size might not include padding
@@ -494,7 +510,6 @@ class TextGenerationController:
         max_sequence_lengths = context.get_max_sequence_lengths()
 
         # Request finished if termination_id or length >= max_sequence_length.
-
         active_request_mask = (new_sample != termination_id).byte() & torch.less(
             active_sequence_lengths, max_sequence_lengths
         ).byte()
@@ -503,11 +518,15 @@ class TextGenerationController:
         )
         finished_request_ids = context.request_ids[finished_idxs]
 
+        log_probs = None
+        if sampling_params.return_log_probs:
+            log_probs = context.calculate_log_probs(logits)
+
         # Update requests.
         # New sample gets updated in update_requests, so we pass in a clone
         context.update_requests(active_request_mask, new_sample.clone())
 
-        return current_request_ids, finished_request_ids, new_sample
+        return current_request_ids, finished_request_ids, new_sample, log_probs
 
     def _update_top_n_logprobs_dict(
         self,
@@ -546,7 +565,7 @@ class TextGenerationController:
         active_requests: OrderedDict[str, InferenceRequest],
         active_streams: Optional[OrderedDict[str, AsyncStream]] = None,
     ) -> OrderedDict[str, InferenceRequest]:
-        """Utility to generate the all the output tokens and probabilities for the prompts .
+        """Utility to generate all the output tokens and probabilities for the prompts.
 
         This utility generates the output tokens for a static batch. It runs the forward steps till
         all prompts complete generation, updates the status of these requests to completed, adds
@@ -579,13 +598,12 @@ class TextGenerationController:
 
         model_config = get_model_config(self.inference_wrapped_model.model)
 
-        # Verify that if echo mode is requested we do not generate any new tokens
-        echo = getattr(sampling_params, "echo", False)
-        assert (
-            not echo or sampling_params.num_tokens_to_generate == 0
-        ), f"Cannot generate new tokens when echoing"
-        if sampling_params.num_tokens_to_generate == 0 and not echo:
-            sampling_params.add_attributes({"echo": True})
+        # We only need an attention mask if we are exclusively doing prefill over
+        # prompts of variable length
+        use_attention_mask = (
+            sampling_params.num_tokens_to_generate == 0
+            and min_prompt_length_in_batch != max_prompt_length_in_batch
+        )
 
         # Check whether CUDA graphs are enabled
         enable_cuda_graph = model_config.enable_cuda_graph
@@ -657,6 +675,10 @@ class TextGenerationController:
         # to nearest power of 2
         vocab_size = self.inference_wrapped_model.inference_wrapper_config.padded_vocab_size
 
+        # Check whether early termination is enabled
+        no_early_termination = getattr(sampling_params, "no_early_termination", False)
+        termination_id = -1 if no_early_termination else self.tokenizer.eod
+
         streaming_enabled = active_streams is not None and len(active_streams) > 0
         if streaming_enabled:
             # Start a separate thread for streaming tokens to avoid blocking the
@@ -674,12 +696,18 @@ class TextGenerationController:
             streaming_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             stream_tokens = functools.partial(self.stream_tokens, sampling_params)
 
-        with torch.inference_mode():
+        for request in active_requests.values():
+            # Initialize to a list to store a latency measurement for each generated token.
+            request.tpot = []
+        timing_events = []
 
+        with torch.inference_mode():
             self.inference_wrapped_model.prep_model_for_inference()
 
             inference_input: Dict[str, Any] = self.prep_inference_input(
-                prompts_tokens=padded_batch_prompt_tokens, active_requests=active_requests
+                prompts_tokens=padded_batch_prompt_tokens,
+                active_requests=active_requests,
+                use_attention_mask=use_attention_mask,
             )
 
             assert (
@@ -696,9 +724,26 @@ class TextGenerationController:
                 self.inference_wrapped_model.model.module.set_symmetric_ar(None)
 
             context_start_position = 0
-            context_end_position = min_prompt_length_in_batch
 
+            # If we are exclusively doing prefill then we can process all prompt tokens
+            # together even if the prompt lengths are different
+            if sampling_params.num_tokens_to_generate == 0:
+                context_end_position = max_prompt_length_in_batch
+            else:
+                context_end_position = min_prompt_length_in_batch
+
+            # The initial iteration of this loop runs the prefill phase up to the shortest
+            # prompt length in the batch. Then every subsequent iterations runs a decode step.
+            # At least one new token will be generated in each iteration. The generated token
+            # will be ignored for requests which have prompt length > the current generated
+            # sequence length. Similarly, the generated token is ignored for requests which
+            # have maximum total sequence length < the current generated sequence length.
             while True:
+                # Add a timing event at the start of each iteration. The token generation
+                # time will be the elapsed time between consective timing events.
+                timing_events.append(torch.cuda.Event(enable_timing=True))
+                timing_events[-1].record()
+
                 # Pick the context window that we need to pass through the network.
                 inference_input_for_context_window: Dict[str, Any] = (
                     self.inference_wrapped_model.get_batch_for_context_window(
@@ -713,6 +758,13 @@ class TextGenerationController:
                     and "attention_mask" in inference_input_for_context_window
                 ):
                     inference_input_for_context_window["attention_mask"] = None
+                elif use_attention_mask:
+                    assert (
+                        attention_mask := inference_input_for_context_window.get(
+                            "attention_mask", None
+                        )
+                        is not None
+                    )
 
                 # Only materialize prompt log probs if the user requests log probs
                 materialize_only_last_token_logits = (
@@ -821,6 +873,7 @@ class TextGenerationController:
                             current_context_end_position=context_end_position,
                             is_generation_done_tensor=is_generation_done_tensor,
                             generated_sequence_lengths=generated_sequence_lengths,
+                            termination_id=termination_id,
                         )
                     )
 
@@ -856,6 +909,10 @@ class TextGenerationController:
                 if context_end_position >= max_sequence_length:
                     break
 
+        # Add a final timing event to compute the latency of every loop iteration
+        timing_events.append(torch.cuda.Event(enable_timing=True))
+        timing_events[-1].record()
+
         # Close all streams
         if streaming_enabled:
             streaming_executor.shutdown()
@@ -874,6 +931,15 @@ class TextGenerationController:
             generated_sequence_lengths > sampling_params.num_tokens_to_generate
         ] = sampling_params.num_tokens_to_generate
 
+        timing_events[-1].synchronize()
+        tpot = torch.tensor(
+            [
+                timing_events[i].elapsed_time(timing_events[i + 1]) / 1e3
+                for i in range(len(timing_events) - 1)
+            ],
+            dtype=torch.float32,
+        )
+
         for idx, request in enumerate(active_requests.values()):
             input_prompt_length = int(prompt_lengths_in_batch[idx])
             # Shorter prompts might have generated more than required tokens. So we trim them down
@@ -888,6 +954,20 @@ class TextGenerationController:
             request.generated_sequence_lengths = generated_sequence_lengths.to(dtype=torch.int32)
             request.generated_length = required_sequence_length
             request.generated_tokens = required_result_tokens
+
+            # Record the decode latencies for only the generated tokens
+            request_tpot = tpot.clone()
+            # Sum up the latencies of the first prompt tokens if the
+            # request prompt length > minimum prompt length
+            spill_length = input_prompt_length - min_prompt_length_in_batch
+            if spill_length > 0:
+                spill_latency = request_tpot[:spill_length].sum()
+                request_tpot = torch.cat((spill_latency.unsqueeze(0), request_tpot[spill_length:]))
+
+            # Remove the extraneous latencies if the
+            # request sequence length < maximum sequence length
+            request_tpot = request_tpot[:required_sequence_length]
+            request.tpot = request_tpot.tolist()
 
             if output_log_probs is not None:
                 request.prompt_log_probs = output_log_probs[idx, : input_prompt_length - 1].tolist()
@@ -936,18 +1016,30 @@ class TextGenerationController:
         return active_requests
 
     def prep_inference_input(
-        self, prompts_tokens: torch.Tensor, active_requests: OrderedDict[str, InferenceRequest]
+        self,
+        prompts_tokens: torch.Tensor,
+        active_requests: OrderedDict[str, InferenceRequest],
+        use_attention_mask: bool = False,
     ) -> Dict[str, Any]:
         """Preparing input data for inference, using respective wrapper's prep_inference_input method # pylint: disable=line-too-long
 
         Args:
             prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_sequence_length]
             active_requests (OrderedDict[str, InferenceRequest]): The input active requests
+            use_attention_mask (bool): Whether to use an attention mask. Should be set to True only
+                when exclusively doing prefill (no decode) with variable prompt lengths.
 
         Returns:
             A dict of the inference input for the current batch.
         """
-        return self.inference_wrapped_model.prep_inference_input(prompts_tokens)
+        inference_input = self.inference_wrapped_model.prep_inference_input(prompts_tokens)
+
+        if use_attention_mask and (
+            attention_mask := inference_input.get("attention_mask", None) is None
+        ):
+            inference_input["attention_mask"] = get_attention_mask(prompts_tokens.size(1))
+
+        return inference_input
 
     def stream_tokens(
         self,

@@ -46,6 +46,7 @@ class InferenceRequest:
     prompt_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     generated_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     generated_length: Optional[int] = None
+    tpot: Optional[List[int]] = None
 
     def __post_init__(self):
         if self.sampling_params is None and self.inference_parameters is not None:
@@ -64,6 +65,7 @@ class DynamicInferenceRequest(InferenceRequest):
 
     """
 
+    request_id: int
     generated_tokens: List[int] = field(default_factory=list)
     prompt: Optional[str] = None
     prompt_tokens: Optional[torch.Tensor] = None
